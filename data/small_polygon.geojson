@@ -1,0 +1,42 @@
+{
+  "type": "FeatureCollection",
+  "name": "small-polygon",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 1,
+      "properties": {"name": "sub-grid polygon"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-0.0025, -0.0025],
+          [0.0025, -0.0025],
+          [0.0025, 0.0025],
+          [-0.0025, 0.0025],
+          [-0.0025, -0.0025]
+        ]]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 2,
+      "properties": {"name": "healthy polygon"},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-10.0, -10.0],
+          [10.0, -10.0],
+          [10.0, 10.0],
+          [-10.0, 10.0],
+          [-10.0, -10.0]
+        ]]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": 3,
+      "properties": {"name": "origin"},
+      "geometry": {"type": "Point", "coordinates": [0.0, 0.0]}
+    }
+  ]
+}

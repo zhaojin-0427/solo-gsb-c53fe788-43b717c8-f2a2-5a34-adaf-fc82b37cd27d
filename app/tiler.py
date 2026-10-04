@@ -79,13 +79,90 @@ def _keep_dimension(geom: BaseGeometry, dimension: int) -> BaseGeometry | None:
     return MultiPolygon(kept) if len(kept) > 1 else kept[0]
 
 
+def _dedup_ring_coords(coords: Any) -> list[tuple] | None:
+    """Collapse consecutive repeated vertices of one quantised polygon ring.
+
+    Returns the closed, deduplicated coordinate list, or ``None`` when the
+    ring cannot span any area afterwards (fewer than three distinct points).
+
+    Repeated points must be removed per ring *before* any ``Polygon`` is built
+    from them: quantisation can collapse a small-but-valid source ring onto a
+    single point, and ``remove_repeated_points`` on such a polygon raises
+    ``GEOSException`` ("Invalid number of points in LinearRing found 2").
+    """
+    deduped: list[tuple] = []
+    for coord in coords:
+        point = tuple(coord)
+        if not deduped or point != deduped[-1]:
+            deduped.append(point)
+    # Input rings are closed; re-close after dedup may have shortened them.
+    if len(deduped) >= 2 and deduped[0] != deduped[-1]:
+        deduped.append(deduped[0])
+    if len(deduped) < 4:
+        # 0-2 distinct points: no area can ever be formed.
+        return None
+    if Polygon(deduped).area <= 0:
+        # Three or more points but collinear / self-touching: still no area.
+        return None
+    return deduped
+
+
+def _clean_quantized_polygon(geom: Polygon) -> BaseGeometry | None:
+    """Rebuild one quantised polygon from its area-bearing rings.
+
+    Rings are adjudicated independently by whether they can still form area:
+
+    * a collapsed *exterior* ring means this polygon has no area at all -> the
+      whole polygon is dropped (inside a MultiPolygon only *this* polygon is
+      dropped, sibling polygons survive),
+    * a collapsed *interior* ring is merely a hole that vanished -> it is
+      removed while the exterior (and the other holes) is kept.
+    """
+    exterior = _dedup_ring_coords(geom.exterior.coords)
+    if exterior is None:
+        return None
+    interiors = [
+        ring
+        for interior in geom.interiors
+        if (ring := _dedup_ring_coords(interior.coords)) is not None
+    ]
+    poly = Polygon(exterior, interiors)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+        if poly.is_empty:
+            return None
+        if not isinstance(poly, Polygon):
+            poly = _keep_dimension(poly, 2)
+    return poly if (poly is not None and not poly.is_empty) else None
+
+
 def _clean_quantized(geom: BaseGeometry) -> BaseGeometry | None:
     """Tidy geometry after rounding so the encoder never sees degenerate rings.
 
     * collapse repeated consecutive vertices (a side effect of quantisation),
     * drop zero-length lines / points and too-small polygon rings,
     * make polygons valid once more.
+
+    Polygon families are cleaned ring by ring *before* reconstruction (see
+    :func:`_dedup_ring_coords`); calling ``remove_repeated_points`` on a
+    polygon whose ring quantised onto one point raises GEOSException.
     """
+    if geom.is_empty:
+        return None
+
+    if isinstance(geom, Polygon):
+        return _clean_quantized_polygon(geom)
+    if isinstance(geom, MultiPolygon):
+        polys: list[BaseGeometry] = []
+        for part in geom.geoms:
+            cleaned = _clean_quantized_polygon(part)
+            if cleaned is not None:
+                polys.extend(_explode(cleaned))
+        if not polys:
+            return None
+        return MultiPolygon(polys) if len(polys) > 1 else polys[0]
+
+    # Points / lines never contain rings, so the GEOS helper is safe for them.
     geom = remove_repeated_points(geom, tolerance=0)
     if geom.is_empty:
         return None
@@ -109,37 +186,9 @@ def _clean_quantized(geom: BaseGeometry) -> BaseGeometry | None:
             return None
         return MultiLineString(lines) if len(lines) > 1 else lines[0]
 
-    if isinstance(geom, Polygon):
-        rings: list[tuple] = []
-        exterior = list(geom.exterior.coords)
-        if len(exterior) >= 4 and Polygon(exterior).area > 0:
-            rings.append(tuple(exterior))
-        for interior in geom.interiors:
-            ring = list(interior.coords)
-            if len(ring) >= 4 and Polygon(ring).area > 0:
-                rings.append(tuple(ring))
-        if not rings:
-            return None
-        poly = Polygon(rings[0], rings[1:])
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-            if poly.is_empty:
-                return None
-            if not isinstance(poly, Polygon):
-                poly = _keep_dimension(poly, 2)
-        return poly if (poly is not None and not poly.is_empty) else None
-
-    if isinstance(geom, MultiPolygon):
-        polys: list[Polygon] = []
-        for part in geom.geoms:
-            cleaned = _clean_quantized(part)
-            if cleaned is not None:
-                polys.extend(_explode(cleaned))
-        if not polys:
-            return None
-        return MultiPolygon(polys) if len(polys) > 1 else polys[0]
-
-    # GeometryCollection should never survive this far; defensively explode.
+    # GeometryCollection should never survive this far; defensively explode
+    # (components are cleaned per type, so degenerate polygon rings inside a
+    # collection are handled instead of being fed to remove_repeated_points).
     cleaned = [c for g in _explode(geom) if (c := _clean_quantized(g)) is not None]
     if not cleaned:
         return None

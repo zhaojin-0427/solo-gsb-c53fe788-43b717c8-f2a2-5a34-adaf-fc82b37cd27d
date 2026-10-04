@@ -175,3 +175,98 @@ def test_feature_order_is_deterministic_regardless_of_input_order(client):
         tile_a, default_options={"y_coord_down": True}
     )
     assert [f["id"] for f in decoded["L"]["features"]] == sorted(ids)
+
+
+# ---------------------------------------------------------------------------
+# Regression: valid sub-grid polygon collapses to <= 2 points when quantised.
+# Previously GEOSException inside remove_repeated_points surfaced as HTTP 500.
+# ---------------------------------------------------------------------------
+
+
+# 0.005-degree box around (0, 0): smaller than one 4096-grid unit at z=0.
+TINY_POLYGON = (
+    b'{"type":"Polygon","coordinates":[[[-0.0025,-0.0025],[0.0025,-0.0025],'
+    b'[0.0025,0.0025],[-0.0025,0.0025],[-0.0025,-0.0025]]]}'
+)
+BIG_POLYGON = (
+    b'{"type":"Polygon","coordinates":[[[-10,-10],[10,-10],[10,10],'
+    b'[-10,10],[-10,-10]]]}'
+)
+
+
+def test_collapsed_polygon_tile_returns_200_encodable_mvt(client):
+    body = (
+        b'{"type":"FeatureCollection","features":['
+        b'{"type":"Feature","id":1,"properties":{"kind":"tiny"},'
+        b'"geometry":' + TINY_POLYGON + b'},'
+        b'{"type":"Feature","id":2,"properties":{"kind":"big"},'
+        b'"geometry":' + BIG_POLYGON + b'},'
+        b'{"type":"Feature","id":3,"properties":{},'
+        b'"geometry":{"type":"Point","coordinates":[0,0]}}]}'
+    )
+    ds = client.post(
+        "/datasets?layer=L",
+        content=body,
+        headers={"content-type": "application/geo+json"},
+    ).json()["id"]
+
+    resp = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/vnd.mapbox-vector-tile"
+    decoded = mapbox_vector_tile.decode(
+        resp.content, default_options={"y_coord_down": True}
+    )
+    # The collapsed polygon is dropped; the other features are not cleared.
+    features = decoded["L"]["features"]
+    assert sorted(f["geometry"]["type"] for f in features) == [
+        "Point",
+        "Polygon",
+    ]
+    assert [
+        f["properties"].get("kind")
+        for f in features
+        if f["geometry"]["type"] == "Polygon"
+    ] == ["big"]
+
+
+def test_tile_with_only_collapsed_polygon_is_empty_but_200(client):
+    body = (
+        b'{"type":"FeatureCollection","features":['
+        b'{"type":"Feature","id":1,"properties":{},"geometry":'
+        + TINY_POLYGON
+        + b'}]}'
+    )
+    ds = client.post(
+        "/datasets?layer=L",
+        content=body,
+        headers={"content-type": "application/geo+json"},
+    ).json()["id"]
+    resp = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt")
+    assert resp.status_code == 200
+    decoded = mapbox_vector_tile.decode(
+        resp.content, default_options={"y_coord_down": True}
+    )
+    assert decoded["L"]["features"] == []
+
+
+def test_collapsed_polygon_tile_bytes_and_pinned_etag_are_stable(client):
+    body = (
+        b'{"type":"FeatureCollection","features":['
+        b'{"type":"Feature","id":1,"properties":{},"geometry":'
+        + TINY_POLYGON
+        + b'},{"type":"Feature","id":2,"properties":{},"geometry":'
+        + BIG_POLYGON
+        + b'}]}'
+    )
+    ds = client.post(
+        "/datasets?layer=L",
+        content=body,
+        headers={"content-type": "application/geo+json"},
+    ).json()["id"]
+    head = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt")
+    pinned = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt?revision=1")
+    again = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt")
+    assert head.status_code == pinned.status_code == 200
+    assert head.content == pinned.content == again.content
+    assert head.headers["etag"] == pinned.headers["etag"] == again.headers["etag"]
+

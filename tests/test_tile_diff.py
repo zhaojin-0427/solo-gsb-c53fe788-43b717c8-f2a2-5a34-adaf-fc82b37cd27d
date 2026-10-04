@@ -468,3 +468,70 @@ def test_tile_endpoint_still_serves_both_revisions(client):
     assert "immutable" in t1.headers["cache-control"]
     assert "immutable" not in head.headers["cache-control"]
     assert t1.content != t2.content
+
+
+# ---------------------------------------------------------------------------
+# Regression: the shared compile path must survive a valid polygon that
+# collapses to <= 2 points under quantisation (used to raise GEOSException,
+# surfacing as HTTP 500 from both the tile and tile-diff endpoints).
+# ---------------------------------------------------------------------------
+
+
+# Smaller than one 4096-grid unit at z=0 (~0.0879 degrees longitude).
+TINY_RING = [
+    [-0.0025, -0.0025],
+    [0.0025, -0.0025],
+    [0.0025, 0.0025],
+    [-0.0025, 0.0025],
+    [-0.0025, -0.0025],
+]
+BIG_RING = [
+    [-10.0, -10.0],
+    [10.0, -10.0],
+    [10.0, 10.0],
+    [-10.0, 10.0],
+    [-10.0, -10.0],
+]
+
+
+def test_diff_compiles_collapsed_polygon_revision_without_error(client):
+    rev1 = [polygon([TINY_RING], {"kind": "tiny"}, fid=1),
+            polygon([BIG_RING], {"kind": "big"}, fid=2)]
+    rev2 = [polygon([BIG_RING], {"kind": "big"}, fid=2)]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+
+    # The manifest endpoint shares the compile path and must return 200 with
+    # the byte-adjudicated list; the collapsed polygon contributes no tile
+    # bytes, so deleting it reports no change.
+    resp = _diff(client, ds, 1, 2, 0)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["changed_tiles"] == []
+
+    # Both pinned tiles are 200 and byte-identical (collapsed feature is a
+    # no-op for the encoder), and their ETags match each other.
+    t1 = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt?revision=1")
+    t2 = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt?revision=2")
+    assert t1.status_code == t2.status_code == 200
+    assert t1.content == t2.content
+    assert t1.headers["etag"] == t2.headers["etag"]
+
+
+def test_diff_reports_change_when_collapsed_polygon_replaces_real_one(client):
+    # Reverse direction: a real polygon shrinks into the sub-grid polygon.
+    rev1 = [polygon([BIG_RING], fid=1)]
+    rev2 = [polygon([TINY_RING], fid=1)]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+
+    resp = _diff(client, ds, 1, 2, 0)
+    assert resp.status_code == 200, resp.text
+    tiles = resp.json()["changed_tiles"]
+    assert [(t["x"], t["y"]) for t in tiles] == [(0, 0)]
+    entry = tiles[0]
+    # ETags equal those of the pinned tile endpoint (shared compile path).
+    t1 = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt?revision=1")
+    t2 = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt?revision=2")
+    assert entry["from_etag"] == t1.headers["etag"]
+    assert entry["to_etag"] == t2.headers["etag"]
+    assert entry["from_etag"] != entry["to_etag"]

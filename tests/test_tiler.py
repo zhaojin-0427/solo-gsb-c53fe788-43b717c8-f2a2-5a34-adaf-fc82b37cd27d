@@ -4,6 +4,7 @@ import math
 import mapbox_vector_tile
 from shapely.geometry import (
     LineString,
+    MultiPolygon,
     Point,
     Polygon,
 )
@@ -214,3 +215,108 @@ def test_degenerate_quantized_polygon_does_not_crash():
     out = tiler.compile_feature_geometry(poly, 5, 16, 5)
     if out is not None:
         assert out.is_valid or out.geom_type.startswith("Multi")
+
+
+# ---------------------------------------------------------------------------
+# Regression: valid small polygons whose rings collapse onto <= 2 points when
+# quantised.  The old pipeline called remove_repeated_points() on the whole
+# polygon first, and GEOS raised "Invalid number of points in LinearRing
+# found 2 - must be 0 or >= 3" -> HTTP 500 on the tile endpoint.
+# ---------------------------------------------------------------------------
+
+
+# At z=0 one tile unit is 360/4096 ~= 0.0879 degrees in longitude; a 0.005
+# degree box around the origin therefore quantises to a single point.
+TINY_BOX = [
+    (-0.0025, -0.0025),
+    (0.0025, -0.0025),
+    (0.0025, 0.0025),
+    (-0.0025, 0.0025),
+    (-0.0025, -0.0025),
+]
+BIG_BOX = [(-10, -10), (10, -10), (10, 10), (-10, 10), (-10, -10)]
+
+
+def _compile(geom):
+    return tiler.compile_feature_geometry(geom, 0, 0, 0)
+
+
+def test_collapsed_exterior_ring_drops_only_that_polygon():
+    out = _compile(Polygon(TINY_BOX))
+    assert out is None
+
+
+def test_collapsed_ring_never_raises_on_clean_helper():
+    # Simulate the quantiser output directly: one point (closed ring) and a
+    # two-distinct-point ring both used to blow up remove_repeated_points.
+    for ring in (
+        [(0, 0), (0, 0), (0, 0), (0, 0)],
+        [(0, 0), (1, 1), (1, 1), (0, 0)],
+        [(0, 0), (1, 1), (2, 2), (0, 0)],  # collinear, area == 0
+    ):
+        assert tiler._clean_quantized(Polygon(ring)) is None
+
+
+def test_collapsed_interior_ring_drops_only_that_hole():
+    holed = Polygon(BIG_BOX, [TINY_BOX])
+    assert len(list(holed.interiors)) == 1  # source is a valid polygon with a hole
+    out = _compile(holed)
+    assert out is not None
+    assert out.geom_type == "Polygon"
+    assert out.area > 0
+    assert len(list(out.interiors)) == 0  # the vanished hole is removed
+
+
+def test_multipolygon_keeps_surviving_sibling_polygons():
+    tiny = Polygon(TINY_BOX)
+    big = Polygon(BIG_BOX)
+    out = _compile(MultiPolygon([tiny, big]))
+    # Only the collapsed part is dropped: the survivor is byte-identical to
+    # compiling the healthy polygon on its own.
+    assert out == _compile(big)
+    assert out.geom_type == "Polygon" and out.area > 0
+
+    # When every part collapses, the whole feature is dropped.
+    tiny2 = Polygon(
+        [(20, 20), (20.0025, 20), (20.0025, 20.0025), (20, 20)]
+    )
+    assert _compile(MultiPolygon([tiny, tiny2])) is None
+
+
+def test_dedup_ring_coords_removes_consecutive_repeats():
+    ring = tiler._dedup_ring_coords(
+        [(0, 0), (1, 0), (1, 0), (1, 1), (0, 1), (0, 1), (0, 0)]
+    )
+    assert ring == [(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]
+
+
+def test_tiny_polygon_tile_is_200_and_other_features_survive():
+    # The small polygon is dropped for the tile, but the point and the normal
+    # polygon next to it must still be encoded.
+    feats = [
+        {"id": 1, "properties": {"kind": "tiny"}, "geometry": Polygon(TINY_BOX)},
+        {"id": 2, "properties": {"kind": "big"}, "geometry": Polygon(BIG_BOX)},
+        {"id": 3, "properties": {}, "geometry": Point(0, 0)},
+    ]
+    body = tiler.compile_tile({"L": feats}, 0, 0, 0)
+    decoded = mapbox_vector_tile.decode(
+        body, default_options={"y_coord_down": True}
+    )
+    kinds = sorted(
+        f["properties"]["kind"]
+        for f in decoded["L"]["features"]
+        if "kind" in f["properties"]
+    )
+    assert kinds == ["big"]
+    types = sorted(f["geometry"]["type"] for f in decoded["L"]["features"])
+    assert types == ["Point", "Polygon"]
+
+
+def test_tile_with_only_collapsed_polygons_still_encodes():
+    feats = [{"id": 1, "properties": {}, "geometry": Polygon(TINY_BOX)}]
+    body = tiler.compile_tile({"L": feats}, 0, 0, 0)
+    decoded = mapbox_vector_tile.decode(
+        body, default_options={"y_coord_down": True}
+    )
+    assert decoded["L"]["features"] == []
+
