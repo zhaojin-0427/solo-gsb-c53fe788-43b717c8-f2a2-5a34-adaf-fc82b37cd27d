@@ -79,13 +79,110 @@ def _keep_dimension(geom: BaseGeometry, dimension: int) -> BaseGeometry | None:
     return MultiPolygon(kept) if len(kept) > 1 else kept[0]
 
 
+def _dedupe_consecutive(coords: list[tuple]) -> list[tuple]:
+    """Drop consecutive repeated vertices (pure Python, never raises).
+
+    Mirrors what ``remove_repeated_points(..., tolerance=0)`` does to one
+    ring, but works on the raw coordinate list so it can run *before* any
+    LinearRing is reconstructed.  A closed input ring stays closed: the
+    final coordinate always equals the first, so it is either appended or
+    dropped because it duplicates the kept first vertex.
+    """
+    kept = [coords[0]]
+    for pt in coords[1:]:
+        if pt != kept[-1]:
+            kept.append(pt)
+    return kept
+
+
+def _ring_coords_or_none(coords) -> list[tuple] | None:
+    """Clean one quantised ring; ``None`` when it cannot enclose area.
+
+    Quantisation can collapse every vertex of a small-but-valid ring onto
+    the same grid point.  Once consecutive duplicates are removed such a
+    ring has fewer than four positions, and rebuilding a GEOS LinearRing
+    from it raises ``GEOSException`` (a two-point ring is illegal).  The
+    ring is therefore adjudicated here -- before any polygon is rebuilt --
+    by whether it can still form a valid area.
+    """
+    deduped = _dedupe_consecutive(list(coords))
+    if len(deduped) < 4:
+        return None
+    if Polygon(deduped).area <= 0:
+        return None
+    return deduped
+
+
+def _clean_quantized_polygon(geom: Polygon) -> BaseGeometry | None:
+    """Rebuild one quantised polygon ring by ring.
+
+    * an exterior ring that collapsed under quantisation drops only this
+      polygon (its holes go with it),
+    * a collapsed interior ring drops only that hole,
+    * surviving rings are reassembled and made valid once more.
+    """
+    exterior = _ring_coords_or_none(geom.exterior.coords)
+    if exterior is None:
+        return None
+    interiors: list[list[tuple]] = []
+    for interior in geom.interiors:
+        ring = _ring_coords_or_none(interior.coords)
+        if ring is not None:
+            interiors.append(ring)
+    poly = Polygon(exterior, interiors)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+        if poly.is_empty:
+            return None
+        if not isinstance(poly, Polygon):
+            poly = _keep_dimension(poly, 2)
+    return poly if (poly is not None and not poly.is_empty) else None
+
+
 def _clean_quantized(geom: BaseGeometry) -> BaseGeometry | None:
     """Tidy geometry after rounding so the encoder never sees degenerate rings.
 
     * collapse repeated consecutive vertices (a side effect of quantisation),
     * drop zero-length lines / points and too-small polygon rings,
     * make polygons valid once more.
+
+    Polygons are cleaned ring by ring *before* reconstruction (see
+    :func:`_clean_quantized_polygon`): a ring whose vertices all rounded to
+    the same grid point is discarded instead of reaching
+    ``remove_repeated_points``, which would raise ``GEOSException`` on the
+    resulting two-point LinearRing.  Points and lines cannot degenerate
+    below GEOS limits that way, so they keep the whole-geometry call.
     """
+    if geom.is_empty:
+        return None
+
+    if isinstance(geom, Polygon):
+        return _clean_quantized_polygon(geom)
+
+    if isinstance(geom, MultiPolygon):
+        # Each part is adjudicated on its own: one collapsed polygon never
+        # drags the surviving parts of the feature down with it.
+        polys: list[Polygon] = []
+        for part in geom.geoms:
+            cleaned = _clean_quantized_polygon(part)
+            if cleaned is not None:
+                polys.extend(_explode(cleaned))
+        if not polys:
+            return None
+        return MultiPolygon(polys) if len(polys) > 1 else polys[0]
+
+    if isinstance(geom, GeometryCollection):
+        # GeometryCollection should never survive this far; defensively
+        # explode and clean each atomic part on its own.
+        cleaned = [c for g in _explode(geom) if (c := _clean_quantized(g)) is not None]
+        if not cleaned:
+            return None
+        return (
+            MultiPolygon(cleaned)
+            if isinstance(cleaned[0], Polygon)
+            else (MultiLineString(cleaned) if isinstance(cleaned[0], LineString) else MultiPoint(cleaned))
+        )
+
     geom = remove_repeated_points(geom, tolerance=0)
     if geom.is_empty:
         return None
@@ -109,45 +206,10 @@ def _clean_quantized(geom: BaseGeometry) -> BaseGeometry | None:
             return None
         return MultiLineString(lines) if len(lines) > 1 else lines[0]
 
-    if isinstance(geom, Polygon):
-        rings: list[tuple] = []
-        exterior = list(geom.exterior.coords)
-        if len(exterior) >= 4 and Polygon(exterior).area > 0:
-            rings.append(tuple(exterior))
-        for interior in geom.interiors:
-            ring = list(interior.coords)
-            if len(ring) >= 4 and Polygon(ring).area > 0:
-                rings.append(tuple(ring))
-        if not rings:
-            return None
-        poly = Polygon(rings[0], rings[1:])
-        if not poly.is_valid:
-            poly = poly.buffer(0)
-            if poly.is_empty:
-                return None
-            if not isinstance(poly, Polygon):
-                poly = _keep_dimension(poly, 2)
-        return poly if (poly is not None and not poly.is_empty) else None
-
-    if isinstance(geom, MultiPolygon):
-        polys: list[Polygon] = []
-        for part in geom.geoms:
-            cleaned = _clean_quantized(part)
-            if cleaned is not None:
-                polys.extend(_explode(cleaned))
-        if not polys:
-            return None
-        return MultiPolygon(polys) if len(polys) > 1 else polys[0]
-
-    # GeometryCollection should never survive this far; defensively explode.
-    cleaned = [c for g in _explode(geom) if (c := _clean_quantized(g)) is not None]
-    if not cleaned:
-        return None
-    return (
-        MultiPolygon(cleaned)
-        if isinstance(cleaned[0], Polygon)
-        else (MultiLineString(cleaned) if isinstance(cleaned[0], LineString) else MultiPoint(cleaned))
-    )
+    # Only Point / MultiPoint / LineString / MultiLineString reach the
+    # whole-geometry ``remove_repeated_points`` above; every container type
+    # has been dispatched already.
+    return None
 
 
 def _quantize(geom: BaseGeometry) -> BaseGeometry:

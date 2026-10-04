@@ -355,6 +355,36 @@ def test_features_without_or_with_duplicate_ids_are_not_missed(client):
     assert expected
 
 
+def test_tiny_polygon_revision_compiles_away_and_diff_survives(client):
+    # A valid ~0.1 mm triangle collapses under quantisation at every
+    # supported zoom.  Adding it changes no tile bytes, so the manifest
+    # stays empty -- and computing it through the shared compile path must
+    # not raise (the pre-fix pipeline threw GEOSException here).
+    tiny = polygon(
+        [[[116.4074, 39.9042], [116.407401, 39.9042],
+          [116.407401, 39.904201], [116.4074, 39.9042]]],
+        {"name": "tiny"},
+        fid=9,
+    )
+    rev1 = [point(116.4074, 39.9042, {"name": "bj"}, fid=1)]
+    rev2 = rev1 + [tiny]
+    ds = _publish_one(client, rev1)
+    _publish_next(client, ds, rev2, 1)
+
+    for z in (0, 7, 14):
+        resp = _diff(client, ds, 1, 2, z)
+        assert resp.status_code == 200
+        assert resp.json()["changed_tiles"] == []
+
+    # A renderable change alongside the tiny polygon is still reported:
+    # revision 3 also moves the point ~3 km east.
+    _publish_next(client, ds, [point(116.44, 39.9042, {"name": "bj"}, fid=1), tiny], 2)
+    changed = _diff(client, ds, 2, 3, 14).json()["changed_tiles"]
+    assert changed, "a real geometry change must produce a manifest entry"
+    for entry in changed:
+        assert entry["from_etag"] != entry["to_etag"]
+
+
 # ---------------------------------------------------------------------------
 # Candidate enumeration
 # ---------------------------------------------------------------------------

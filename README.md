@@ -20,6 +20,7 @@
 | 8 像素缓冲裁剪 | 点 / 线 / 面先裁剪到瓦片外扩 **8 px（128/4096 单位）**的边界，保证跨瓦片连续 |
 | 0.5 px 拓扑简化 | 以 **0.5 px（8/4096 单位）**容差做保拓扑 Douglas–Peucker 简化 |
 | 4096 量化 | 坐标四舍五入到整数 4096 网格，并清除退化线 / 零面积环 |
+| 退化环裁决 | 量化后面环坍缩（合法小多边形的顶点全部落入同一网格点）时**逐环清理、按能否围成有效面积裁决**：外环坍缩仅丢该面、内环坍缩仅去该孔、MultiPolygon 保留其余有效子面；瓦片返回 **200** 与可编码 MVT 而非 500，同瓦片其他要素与既有瓦片字节、钉版 ETag 均不变（见 [§4.8](#48-退化小多边形坍缩环裁决复核)） |
 | 稳定排序 | 图层按名称、要素按 ID（数值 → 字符串 → 内容哈希）确定性排序后编码 |
 | 字节一致 / ETag | 同一 revision + 同一瓦片坐标，重复请求**字节完全相同、ETag 相同**；已编译瓦片持久化到 SQLite |
 | 条件请求 | 支持 `If-None-Match`，命中时返回 **304 Not Modified** |
@@ -40,10 +41,14 @@
 │   ├── geojson.py       # GeoJSON 校验与规范化
 │   ├── db.py            # SQLite 存储（datasets / revisions / tile_cache，非阻塞跨进程建库锁与事务）
 │   └── config.py        # 环境变量配置
-├── data/sample.geojson  # 示例图层（点 / 线 / 面）
+├── data/
+│   ├── sample.geojson          # 示例图层（点 / 线 / 面）
+│   ├── tiny-polygon.geojson    # 退化小多边形复核 revision 1（含 ~0.1 mm 小三角，见 §4.8）
+│   ├── tiny-polygon-v2.geojson # 复核 revision 2：删除小三角、点属性改名
+│   └── tiny-polygon-v3.geojson # 复核 revision 3：仅把小三角加回（瓦片与 v2 逐字节相同）
 ├── scripts/
 │   └── hold_init_lock.py # 持锁复核辅助：独占 <db>.init.lock（可定时释放）
-├── tests/               # pytest 测试（84 个用例，含瓦片增量清单、非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
+├── tests/               # pytest 测试（91 个用例，含瓦片增量清单、量化坍缩环裁决、非阻塞建库锁、初始化竞态与跨进程追加发布竞态回归）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -774,6 +779,204 @@ curl -i -X POST http://localhost:8000/datasets \
 # {"error":"FeatureCollection contains no features"}
 ```
 
+### 4.8 退化小多边形：坍缩环裁决复核
+
+源 GeoJSON 中**完全合法**的小多边形（例如边长约 0.1 mm 的三角形）在 4096 网格
+量化时，环的全部顶点可能四舍五入到**同一个网格点**：环坍缩成两点，无法构成 GEOS
+LinearRing。管线在**重建面之前逐环清理**，并按“能否围成有效面积”裁决（见
+`app/tiler.py` 的 `_clean_quantized_polygon`）：
+
+| 坍缩对象 | 裁决 |
+| --- | --- |
+| 外环 | 仅丢弃**该面**（其内环随之丢弃），同瓦片其他要素不受影响 |
+| 内环（孔） | 仅去除**该孔**，外环与其余孔保留 |
+| MultiPolygon 的某个子面 | 仅丢弃**该子面**，其余有效子面保留 |
+
+因此瓦片请求始终返回 **200** 与可解码的 MVT，而不是 500；未坍缩的几何编译结果、
+既有瓦片字节与钉版 ETag 完全不变。下面用 `data/tiny-polygon.geojson` 复核——它包含
+一个 ~0.1 mm 小三角（id=1）、一个普通点（id=2）、一个带微孔的矩形（id=3）和一个
+含微小部分的 MultiPolygon（id=4）：
+
+**第 1 步：发布（revision 1）**
+
+```bash
+curl -s -X POST http://localhost:8000/datasets \
+  -F "file=@data/tiny-polygon.geojson;type=application/geo+json" \
+  -F "layer=demo"
+```
+
+```json
+{
+    "id": "9aa5d65f03624f5e9c8bd50889ee1932",
+    "layer": "demo",
+    "revision": 1,
+    "content_hash": "e571e857bf09853247b5ad70ec77da50d44d933350414bd57b3bf2e8a49d0220",
+    "feature_count": 4,
+    "published_at": "2026-10-04T07:42:18Z"
+}
+```
+
+```bash
+DS=9aa5d65f03624f5e9c8bd50889ee1932   # 换成实际上一步返回的 id
+```
+
+**第 2 步：请求 z=0 世界瓦片——200，其余要素全部保留**
+
+```bash
+curl -s -D - -o /tmp/tiny-z0.mvt \
+  "http://localhost:8000/datasets/$DS/tiles/0/0/0.mvt"
+```
+
+```http
+HTTP/1.1 200 OK
+etag: "78531fb9e3334d4e091edb5d7f6e4b1c1c69b818448a8ec6dcef2744e4c50493"
+x-revision: 1
+content-length: 181
+cache-control: public, no-cache
+content-type: application/vnd.mapbox-vector-tile
+```
+
+解码可见：小三角（id=1）被丢弃，矩形的微孔与 MultiPolygon 的微小部分被去除，
+但三个要素本身与点要素都保留在瓦片中（在容器内解码，无需本地安装依赖）：
+
+```bash
+docker compose exec -T vector-tiles python - <<EOF
+import json, urllib.request, mapbox_vector_tile
+url = "http://127.0.0.1:8000/datasets/$DS/tiles/0/0/0.mvt"
+body = urllib.request.urlopen(url).read()
+dec = mapbox_vector_tile.decode(body, default_options={"y_coord_down": True})
+for name, layer in dec.items():
+    for f in layer["features"]:
+        print(name, "id:", f["id"], f["geometry"]["type"],
+              json.dumps(f["properties"], ensure_ascii=False))
+EOF
+```
+
+```text
+demo id: 2 Point {"kind": "capital", "name": "Beijing"}
+demo id: 3 Polygon {"name": "Rectangle with a tiny hole"}
+demo id: 4 Polygon {"name": "MultiPolygon with a tiny part"}
+```
+
+即使在 z=14（1 网格单位 ≈ 0.6 m），0.1 mm 的三角形仍然坍缩，瓦片同样正常返回
+200（该瓦片只剩点要素，66 字节）：
+
+```bash
+curl -s -D - -o /dev/null \
+  "http://localhost:8000/datasets/$DS/tiles/14/13489/6208.mvt?revision=1"
+```
+
+```http
+HTTP/1.1 200 OK
+etag: "202dfb9ef3bd1a8f6bdc01122dff1d96874afb9e1395072f9849b1a14ac525ee"
+x-revision: 1
+content-length: 66
+cache-control: public, max-age=31536000, immutable
+```
+
+**第 3 步：发布 revision 2（删除小三角、点属性改名）**
+
+```bash
+curl -s -X POST "http://localhost:8000/datasets/$DS/revisions" \
+  -F "file=@data/tiny-polygon-v2.geojson;type=application/geo+json" \
+  -F "expected_revision=1"
+```
+
+```json
+{
+    "id": "9aa5d65f03624f5e9c8bd50889ee1932",
+    "layer": "demo",
+    "revision": 2,
+    "content_hash": "f20f39e4ecf704de4b6163fb36a1f855c6419eaf730ea573c0b3e75ed72e293e",
+    "feature_count": 3,
+    "published_at": "2026-10-04T07:42:36Z"
+}
+```
+
+**第 4 步：增量清单——复用同一编译路径，按最终字节裁决**
+
+```bash
+curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=1&to_revision=2&z=0" \
+  | python3 -m json.tool
+```
+
+```json
+{
+    "dataset_id": "9aa5d65f03624f5e9c8bd50889ee1932",
+    "z": 0,
+    "from_revision": 1,
+    "to_revision": 2,
+    "changed_tiles": [
+        {
+            "z": 0,
+            "x": 0,
+            "y": 0,
+            "from_etag": "\"78531fb9e3334d4e091edb5d7f6e4b1c1c69b818448a8ec6dcef2744e4c50493\"",
+            "to_etag": "\"e100dd6348db1b4e814c65753f85c317ef5c220fd8cebfc165f626640e78dc85\""
+        }
+    ]
+}
+```
+
+瓦片 (0,0,0) 的字节变化来自点要素属性改名（`Beijing` → `Beijing HQ`）；小三角的
+删除不贡献任何字节变化——它从未进入瓦片。`from_etag` 与第 2 步钉版瓦片的 ETag
+一致；`to_etag` 可用钉版接口核对：
+
+```bash
+curl -s -D - -o /dev/null "http://localhost:8000/datasets/$DS/tiles/0/0/0.mvt?revision=2" \
+  | grep -i etag
+# etag: "e100dd6348db1b4e814c65753f85c317ef5c220fd8cebfc165f626640e78dc85"
+```
+
+**第 5 步：只有小三角变化的修订——清单为空（不多报）**
+
+把小三角加回去发布 revision 3（`data/tiny-polygon-v3.geojson`，其余内容与
+revision 2 完全相同）：
+
+```bash
+curl -s -X POST "http://localhost:8000/datasets/$DS/revisions" \
+  -F "file=@data/tiny-polygon-v3.geojson;type=application/geo+json" \
+  -F "expected_revision=2"
+
+curl -s "http://localhost:8000/datasets/$DS/tile-diff?from_revision=2&to_revision=3&z=0" \
+  | python3 -m json.tool
+```
+
+```json
+{
+    "dataset_id": "9aa5d65f03624f5e9c8bd50889ee1932",
+    "z": 0,
+    "from_revision": 2,
+    "to_revision": 3,
+    "changed_tiles": []
+}
+```
+
+源文档确实不同（`content_hash` 分别为 `f20f39e4…` 与 `45fc2d3e…`），但两个修订的
+瓦片**逐字节相同**——钉版 ETag 都是 `e100dd63…`，因此清单为空：
+
+```bash
+curl -s -D - -o /dev/null "http://localhost:8000/datasets/$DS/tiles/0/0/0.mvt?revision=3" \
+  | grep -i etag
+# etag: "e100dd6348db1b4e814c65753f85c317ef5c220fd8cebfc165f626640e78dc85"
+```
+
+**非法源几何仍在发布期拒绝（400）**，不会进入瓦片管线（自相交 bowtie 多边形）：
+
+```bash
+curl -s -w "\n%{http_code}\n" -X POST http://localhost:8000/datasets \
+  -H "Content-Type: application/json" \
+  -d '{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Polygon","coordinates":[[[0,0],[10,10],[10,0],[0,10],[0,0]]]}}]}'
+```
+
+```json
+{"error":"feature[0]: geometry is topologically invalid (Self-intersection[5 5])"}
+```
+
+```text
+400
+```
+
 ---
 
 ## 5. 瓦片规格（编译管线）
@@ -788,7 +991,12 @@ curl -i -X POST http://localhost:8000/datasets \
 3. **简化**：`preserve_topology=True` 的 Douglas–Peucker 简化，容差
    **0.5 像素 = 8 单位**。
 4. **量化与清洗**：四舍五入到整数网格并夹在缓冲窗口内；删除重合点、
-   零长度线段与零面积环，保证几何有效。
+   零长度线段与零面积环，保证几何有效。面在**重建之前逐环清理**并按能否
+   围成有效面积裁决：外环坍缩（合法小多边形的顶点全部量化到同一网格点）
+   仅丢弃该面，内环坍缩仅去除该孔，MultiPolygon 的坍缩子面不影响其余有效
+   子面——坍缩环因此永远不会以两点 LinearRing 的形式进入 GEOS 重建而抛出
+   `GEOSException`，同瓦片其他要素保持不变（复核见
+   [§4.8](#48-退化小多边形坍缩环裁决复核)）。
 5. **稳定排序编码**：图层名升序，要素按 ID 分类确定性排序
    （非负整数 ID → 字符串 ID → 无 ID 者按内容 SHA-256），属性键排序，
    再交给 `mapbox-vector-tile` 编码为 MVT v2（`extent=4096`）。

@@ -175,3 +175,51 @@ def test_feature_order_is_deterministic_regardless_of_input_order(client):
         tile_a, default_options={"y_coord_down": True}
     )
     assert [f["id"] for f in decoded["L"]["features"]] == sorted(ids)
+
+
+# ---------------------------------------------------------------------------
+# Valid tiny polygons (quantised ring collapse)
+# ---------------------------------------------------------------------------
+
+# A valid ~0.1 mm triangle near Beijing plus a normal point at the same
+# spot.  The triangle's exterior ring collapses to a single 4096-grid point
+# at z=0; the tile must still compile (200) and keep the other feature.
+TINY_POLYGON_COLLECTION = (
+    b'{"type":"FeatureCollection","features":['
+    b'{"type":"Feature","id":1,"properties":{"name":"tiny"},'
+    b'"geometry":{"type":"Polygon","coordinates":[[[116.4074,39.9042],'
+    b'[116.407401,39.9042],[116.407401,39.904201],[116.4074,39.9042]]]}},'
+    b'{"type":"Feature","id":2,"properties":{"name":"Beijing"},'
+    b'"geometry":{"type":"Point","coordinates":[116.4074,39.9042]}}]}'
+)
+
+
+def test_tile_with_collapsing_tiny_polygon_returns_200(client):
+    resp = client.post(
+        "/datasets?layer=demo",
+        content=TINY_POLYGON_COLLECTION,
+        headers={"content-type": "application/geo+json"},
+    )
+    assert resp.status_code == 201
+    ds = resp.json()["id"]
+
+    tile = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt")
+    assert tile.status_code == 200
+    assert tile.headers["content-type"] == "application/vnd.mapbox-vector-tile"
+
+    # Encodable MVT: the collapsed polygon is gone, the point is kept.
+    decoded = mapbox_vector_tile.decode(
+        tile.content, default_options={"y_coord_down": True}
+    )
+    assert [f["id"] for f in decoded["demo"]["features"]] == [2]
+
+    # The pinned revision serves byte-identical content with the same ETag.
+    pinned = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt?revision=1")
+    assert pinned.status_code == 200
+    assert pinned.content == tile.content
+    assert pinned.headers["etag"] == tile.headers["etag"]
+
+    # Repeat requests stay byte-identical (compiled via the cache path too).
+    again = client.get(f"/datasets/{ds}/tiles/0/0/0.mvt")
+    assert again.content == tile.content
+    assert again.headers["etag"] == tile.headers["etag"]

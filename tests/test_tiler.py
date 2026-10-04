@@ -4,6 +4,7 @@ import math
 import mapbox_vector_tile
 from shapely.geometry import (
     LineString,
+    MultiPolygon,
     Point,
     Polygon,
 )
@@ -214,3 +215,75 @@ def test_degenerate_quantized_polygon_does_not_crash():
     out = tiler.compile_feature_geometry(poly, 5, 16, 5)
     if out is not None:
         assert out.is_valid or out.geom_type.startswith("Multi")
+
+
+# ---------------------------------------------------------------------------
+# Quantised ring collapse (valid tiny source polygons)
+# ---------------------------------------------------------------------------
+
+# A valid ~0.1 mm triangle near Beijing.  At every supported zoom its
+# exterior ring rounds to a single 4096-grid point, so the ring collapses.
+TINY_TRIANGLE = Polygon(
+    [
+        (116.4074, 39.9042),
+        (116.407401, 39.9042),
+        (116.407401, 39.904201),
+        (116.4074, 39.9042),
+    ]
+)
+
+
+def test_tiny_valid_polygon_collapses_without_raising():
+    # The source polygon is perfectly valid; quantisation alone collapses
+    # its exterior ring to two points.  Only this feature is dropped from
+    # the tile -- the pipeline must not raise GEOSException.
+    assert TINY_TRIANGLE.is_valid
+    for z, x, y in [(0, 0, 0), (7, 105, 48), (14, 13489, 6208)]:
+        assert tiler.compile_feature_geometry(TINY_TRIANGLE, z, x, y) is None
+
+
+def test_collapsed_exterior_drops_only_that_polygon():
+    # Direct check of the post-quantisation cleaner: an exterior ring whose
+    # vertices all rounded to the same grid point drops the polygon.
+    collapsed = Polygon([(7, 7), (7, 7), (7, 7), (7, 7)])
+    assert tiler._clean_quantized(collapsed) is None
+
+
+def test_collapsed_hole_is_dropped_but_polygon_kept():
+    holed = Polygon(
+        [(100.0, 10.0), (110.0, 10.0), (110.0, 20.0), (100.0, 20.0),
+         (100.0, 10.0)],
+        [[(105.0, 15.0), (105.000001, 15.0), (105.000001, 15.000001),
+          (105.0, 15.0)]],
+    )
+    out = tiler.compile_feature_geometry(holed, 0, 0, 0)
+    assert out is not None
+    assert out.geom_type == "Polygon"
+    assert len(out.interiors) == 0  # only the collapsed hole is gone
+    assert out.area > 0
+
+
+def test_collapsed_multipolygon_part_is_dropped_but_rest_kept():
+    big = Polygon([(100.0, 10.0), (110.0, 10.0), (110.0, 20.0), (100.0, 10.0)])
+    out = tiler.compile_feature_geometry(
+        MultiPolygon([TINY_TRIANGLE, big]), 0, 0, 0
+    )
+    assert out is not None
+    assert out.area > 0
+
+
+def test_collapsed_polygon_does_not_clear_other_tile_features():
+    body = tiler.compile_tile(
+        {
+            "demo": [
+                {"id": 1, "properties": {"name": "tiny"}, "geometry": TINY_TRIANGLE},
+                {"id": 2, "properties": {"name": "bj"}, "geometry": Point(116.4074, 39.9042)},
+            ]
+        },
+        0, 0, 0,
+    )
+    decoded = mapbox_vector_tile.decode(
+        body, default_options={"y_coord_down": True}
+    )
+    # The point feature survives; the collapsed polygon is simply absent.
+    assert [f["id"] for f in decoded["demo"]["features"]] == [2]
